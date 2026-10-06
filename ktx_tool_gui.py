@@ -7,6 +7,11 @@ Encode:  выбрал новую картинку + оригинальный .kt
          -> (по желанию растянул до 2K/4K/8K) -> Save As.
 Upscale: выбрал .ktx -> декод -> растяжение до 8K -> энкод -> Save As.
 
+Поддерживается: KTX v1, BC7 (sRGB/linear), BC4, RGBA8 (обычный и sRGB),
+простые 2D-текстуры и массивы слоёв. У массива слои в PNG лежат рядом
+слева направо (2 слоя 256x256 -> картинка 512x256); при Encode подавай
+картинку в таком же виде.
+
 Что нового в этой версии:
   * кодирование переписано на NumPy и разбито на полосы, которые считаются
     параллельно на всех ядрах (отдельные процессы) - 8K занимает секунды;
@@ -72,6 +77,7 @@ FORMATS = {
     0x8E8C: ("BC7 linear", "bc7"),
     0x8DBB: ("BC4 / RGTC1", "bc4"),
     0x8058: ("RGBA8 (несжатый)", "rgba8"),
+    0x8C43: ("RGBA8 sRGB (несжатый)", "rgba8"),
 }
 
 
@@ -98,9 +104,24 @@ def parse_ktx(path):
 
 
 def check_simple_2d(header):
-    if header['numberOfFaces'] > 1 or header['numberOfArrayElements'] > 0:
-        raise ValueError("Этот .ktx содержит кубмапу/массив слоёв.\n"
-                         "Инструмент поддерживает только простые 2D-текстуры.")
+    if header['numberOfFaces'] > 1:
+        raise ValueError("Этот .ktx содержит кубмапу.\n"
+                         "Инструмент поддерживает только 2D-текстуры и массивы слоёв.")
+    if header['pixelDepth'] > 1:
+        raise ValueError("Этот .ktx содержит 3D-текстуру - не поддерживается.")
+
+
+def layer_count(header):
+    """Сколько слоёв в текстуре (1 для обычной 2D)."""
+    return max(1, header['numberOfArrayElements'])
+
+
+def ktx_layer_count(path):
+    with open(path, "rb") as f:
+        data = f.read(64)
+    if data[0:12] != KTX_IDENTIFIER:
+        raise ValueError("Не похоже на KTX v1 файл (неверная сигнатура)")
+    return layer_count(dict(zip(HEADER_NAMES, struct.unpack_from("<12I", data, 16))))
 
 
 # ============================================================
@@ -330,6 +351,40 @@ def decode_image(kind, image_data, width, height):
         if kind == "bc7":
             return decode_bc7_image_py(image_data, width, height)
         return decode_bc4_image_py(image_data, width, height)
+
+
+def decode_layers(kind, image_data, width, height, layers):
+    """Декодирует mip0 со всеми слоями. Слои кладутся рядом слева направо,
+    так что картинка получается шириной width * layers."""
+    if layers <= 1:
+        return decode_image(kind, image_data, width, height)
+    per = len(image_data) // layers
+    atlas = Image.new("RGBA", (width * layers, height))
+    for i in range(layers):
+        layer = decode_image(kind, image_data[i * per:(i + 1) * per], width, height)
+        atlas.paste(layer, (i * width, 0))
+    return atlas
+
+
+def split_layers(img, layers):
+    """Режет ленту обратно на слои одинаковой ширины."""
+    if layers <= 1:
+        return [img]
+    if img.width % layers:
+        raise ValueError(f"В оригинале {layers} слоя(ёв): ширина картинки ({img.width}) "
+                         f"должна делиться на {layers} - слои лежат рядом слева направо.")
+    w = img.width // layers
+    return [img.crop((i * w, 0, (i + 1) * w, img.height)) for i in range(layers)]
+
+
+def resize_layers(img, layers, layer_size, resample):
+    """Масштабирует каждый слой отдельно, чтобы соседние слои не смешивались на стыке."""
+    if layers <= 1:
+        return resize_image(img, layer_size, resample)
+    out = Image.new(img.mode, (layer_size[0] * layers, layer_size[1]))
+    for i, layer in enumerate(split_layers(img, layers)):
+        out.paste(resize_image(layer, layer_size, resample), (i * layer_size[0], 0))
+    return out
 
 
 # ============================================================
@@ -571,12 +626,13 @@ def build_ktx(image, original_ktx_path, progress=lambda frac, text: None):
     check_simple_2d(header_d)
     fmt_name, kind = FORMATS[header_d['glInternalFormat']]
 
-    img = image.convert("L" if kind == "bc4" else "RGBA")
-    w, h = img.size
+    layers = layer_count(header_d)
+    layer_imgs = split_layers(image.convert("L" if kind == "bc4" else "RGBA"), layers)
+    w, h = layer_imgs[0].size
     levels = mip_level_count(header_d, w, h)
 
     sizes = [(max(1, w >> i), max(1, h >> i)) for i in range(levels)]
-    total_blocks = sum(((mw + 3) // 4) * ((mh + 3) // 4) for mw, mh in sizes)
+    total_blocks = layers * sum(((mw + 3) // 4) * ((mh + 3) // 4) for mw, mh in sizes)
     done = [0]
 
     def on_blocks(nblocks):
@@ -591,11 +647,11 @@ def build_ktx(image, original_ktx_path, progress=lambda frac, text: None):
 
     out = [bytes(header)]
     mip0 = None
-    level_img = img
     for i, (mw, mh) in enumerate(sizes):
         if i > 0:
-            level_img = resize_image(level_img, (mw, mh), _RES.BOX)
-        data = encode_level(level_img, kind, on_blocks)
+            layer_imgs = [resize_image(li, (mw, mh), _RES.BOX) for li in layer_imgs]
+        # в KTX слои одного мип-уровня идут подряд под общим imageSize
+        data = b"".join(encode_level(li, kind, on_blocks) for li in layer_imgs)
         if i == 0:
             mip0 = data
         out.append(struct.pack("<I", len(data)))
@@ -604,7 +660,7 @@ def build_ktx(image, original_ktx_path, progress=lambda frac, text: None):
             out.append(b"\x00" * (4 - len(data) % 4))
 
     return dict(bytes=b"".join(out), mip0=mip0, kind=kind, fmt_name=fmt_name,
-                width=w, height=h, levels=levels)
+                width=w, height=h, levels=levels, layers=layers)
 
 
 def repack_ktx_bytes(new_image, original_ktx_path):
@@ -751,17 +807,19 @@ class KtxToolApp(tk.Tk):
             check_simple_2d(header)
             w, h = header['pixelWidth'], header['pixelHeight']
             fmt_name, kind = FORMATS[header['glInternalFormat']]
-            img = decode_image(kind, image_data, w, h)
-            return img, w, h, fmt_name, len(image_data), header['numberOfMipmapLevels']
+            layers = layer_count(header)
+            img = decode_layers(kind, image_data, w, h, layers)
+            return img, w, h, fmt_name, len(image_data), header['numberOfMipmapLevels'], layers
 
         def done(res):
-            img, w, h, fmt_name, nbytes, mips = res
+            img, w, h, fmt_name, nbytes, mips, layers = res
             self.decoded_image = img
             self.decode_source_path = path
             self.decode_path_label.config(text=path)
             self.decode_info_label.config(
                 text=f"{w}x{h}  |  {fmt_name}  |  мип-уровней: {max(1, mips)}  |  "
-                     f"{nbytes:,} байт данных изображения")
+                     f"{nbytes:,} байт данных изображения"
+                     + (f"  |  слоёв: {layers} (лежат рядом слева направо)" if layers > 1 else ""))
             self._show_preview(self.decode_canvas, img)
 
         self._run_bg(work, done, "Ошибка декодирования")
@@ -862,15 +920,18 @@ class KtxToolApp(tk.Tk):
 
         def work(progress):
             img = image.convert("RGBA")
-            size = target_size(img.width, img.height, long_side)
-            if size != img.size:
+            layers = ktx_layer_count(orig_path)
+            lw = split_layers(img, layers)[0].width
+            size = target_size(lw, img.height, long_side)
+            if size != (lw, img.height):
                 progress(0.02, f"Масштабирование до {size[0]}x{size[1]}...")
-                img = resize_image(img, size, resample)
+                img = resize_layers(img, layers, size, resample)
             res = build_ktx(img, orig_path,
                             lambda f, t: progress(0.1 + 0.8 * f, t))
             progress(0.92, "Готовлю превью...")
             # раскодируем обратно, чтобы честно показать, как это будет выглядеть в игре
-            res["preview"] = decode_image(res["kind"], res["mip0"], res["width"], res["height"])
+            res["preview"] = decode_layers(res["kind"], res["mip0"], res["width"], res["height"],
+                                           res["layers"])
             return res
 
         def done(res):
@@ -945,15 +1006,17 @@ class KtxToolApp(tk.Tk):
             check_simple_2d(header)
             w, h = header['pixelWidth'], header['pixelHeight']
             _, kind = FORMATS[header['glInternalFormat']]
-            img = decode_image(kind, image_data, w, h)
+            layers = layer_count(header)
+            img = decode_layers(kind, image_data, w, h, layers)
             size = target_size(w, h, long_side)
             progress(0.05, f"Масштабирование {w}x{h} -> {size[0]}x{size[1]}...")
-            img = resize_image(img, size, resample)
+            img = resize_layers(img, layers, size, resample)
             res = build_ktx(img, src_path,
                             lambda f, t: progress(0.15 + 0.75 * f, t))
             del img
             progress(0.92, "Готовлю превью...")
-            res["preview"] = decode_image(res["kind"], res["mip0"], res["width"], res["height"])
+            res["preview"] = decode_layers(res["kind"], res["mip0"], res["width"], res["height"],
+                                           res["layers"])
             res["source_size"] = (w, h)
             return res
 
@@ -975,7 +1038,8 @@ class KtxToolApp(tk.Tk):
     # ---------------- общие утилиты ----------------
     @staticmethod
     def _result_text(res):
-        return (f"{res['width']}x{res['height']}  |  {res['fmt_name']}  |  "
+        layers = f"слоёв: {res['layers']}  |  " if res.get("layers", 1) > 1 else ""
+        return (f"{res['width']}x{res['height']}  |  {res['fmt_name']}  |  {layers}"
                 f"мип-уровней: {res['levels']}  |  {len(res['bytes']):,} байт  |  "
                 "превью - результат ПОСЛЕ сжатия")
 
