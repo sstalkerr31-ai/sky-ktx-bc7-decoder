@@ -20,8 +20,15 @@ Upscale: выбрал .ktx -> декод -> растяжение до 8K -> эн
     запуск не затирает чистый оригинал), кнопка "Восстановить" возвращает их.
 
 Поддерживается: KTX v1, BC7 (sRGB/linear), BC4, RGBA8 (обычный и sRGB),
-простые 2D-текстуры и массивы слоёв. У массива слои в PNG лежат рядом
-слева направо (2 слоя 256x256 -> картинка 512x256); при Encode подавай
+простые 2D-текстуры и массивы слоёв.
+Мобильные (Android) текстуры: ETC1, ETC2 RGB / RGBA (EAC) / 1-бит альфы,
+EAC R11 / RG11 декодируются своим декодером на NumPy (без доп. модулей),
+ASTC (все размеры блока) - через необязательный модуль:
+    pip install texture2ddecoder
+Кодирование (Encode / Upscale / массовый Encode) работает для ETC2 RGB8,
+ETC2 RGBA8 (EAC), EAC R11 и RG11. ASTC, ETC2 с 1-бит альфой и signed EAC -
+только декодирование.
+У массива слои в PNG лежат рядом слева направо (2 слоя 256x256 -> картинка 512x256); при Encode подавай
 картинку в таком же виде.
 
 Что нового в этой версии:
@@ -358,10 +365,272 @@ def decode_raw_rgba8_image(image_data, width, height):
     return Image.frombytes("RGBA", (width, height), data)
 
 
+# ---------- мобильные форматы: ETC1/ETC2/EAC (свой декодер на NumPy) и ASTC ----------
+# Блоки декодируются сразу пачками через NumPy. Раскладка пикселей в блоке у ETC
+# "по столбцам": номер пикселя p = x * 4 + y.
+
+_ETC_CHUNK = 32768             # блоков за один заход (держит расход памяти в рамках)
+
+_ETC_MOD = np.array([[2, 8], [5, 17], [9, 29], [13, 42],
+                     [18, 60], [24, 80], [33, 106], [47, 183]], dtype=np.int64)
+_ETC2_DIST = np.array([3, 6, 11, 16, 23, 32, 41, 64], dtype=np.int64)
+_EAC_MOD = np.array([
+    [-3, -6, -9, -15, 2, 5, 8, 14], [-3, -7, -10, -13, 2, 6, 9, 12],
+    [-2, -5, -8, -13, 1, 4, 7, 12], [-2, -4, -6, -13, 1, 3, 5, 12],
+    [-3, -6, -8, -12, 2, 5, 7, 11], [-3, -7, -9, -11, 2, 6, 8, 10],
+    [-4, -7, -8, -11, 3, 6, 7, 10], [-3, -5, -8, -11, 2, 4, 7, 10],
+    [-2, -6, -8, -10, 1, 5, 7, 9], [-2, -5, -8, -10, 1, 4, 7, 9],
+    [-2, -4, -8, -10, 1, 3, 7, 9], [-2, -5, -7, -10, 1, 4, 6, 9],
+    [-3, -4, -7, -10, 2, 3, 6, 9], [-1, -2, -3, -10, 0, 1, 2, 9],
+    [-4, -6, -8, -9, 3, 5, 7, 8], [-3, -5, -7, -9, 2, 4, 6, 8],
+], dtype=np.int64)
+_P16 = np.arange(16, dtype=np.int64)
+_PX, _PY = _P16 // 4, _P16 % 4
+
+# KTX: glInternalFormat -> (имя, тип) для ETC/EAC
+ETC_FORMATS = {
+    0x8D64: ("ETC1 RGB", "etc2"),
+    0x9274: ("ETC2 RGB8", "etc2"),
+    0x9275: ("ETC2 RGB8 sRGB", "etc2"),
+    0x9276: ("ETC2 RGB8 + 1 бит альфы", "etc2a1"),
+    0x9277: ("ETC2 RGB8 + 1 бит альфы sRGB", "etc2a1"),
+    0x9278: ("ETC2 RGBA8 (EAC)", "etc2a8"),
+    0x9279: ("ETC2 RGBA8 (EAC) sRGB", "etc2a8"),
+    0x9270: ("EAC R11", "eac_r"),
+    0x9271: ("EAC R11 signed", "eac_rs"),
+    0x9272: ("EAC RG11", "eac_rg"),
+    0x9273: ("EAC RG11 signed", "eac_rgs"),
+}
+ASTC_BLOCKS = [(4, 4), (5, 4), (5, 5), (6, 5), (6, 6), (8, 5), (8, 6), (8, 8),
+               (10, 5), (10, 6), (10, 8), (10, 10), (12, 10), (12, 12)]
+ASTC_FORMATS = {}
+for _i, (_bx, _by) in enumerate(ASTC_BLOCKS):
+    ASTC_FORMATS[0x93B0 + _i] = (f"ASTC {_bx}x{_by}", f"astc{_bx}x{_by}")
+    ASTC_FORMATS[0x93D0 + _i] = (f"ASTC {_bx}x{_by} sRGB", f"astc{_bx}x{_by}")
+
+
+def _etc_idx_word(b):
+    """Байты 4..7 блока -> 32 бита индексов; msb/lsb каждого пикселя -> индекс 0..3."""
+    w = (b[:, 4] << 24) | (b[:, 5] << 16) | (b[:, 6] << 8) | b[:, 7]
+    lsb = (w[:, None] >> _P16) & 1
+    msb = (w[:, None] >> (_P16 + 16)) & 1
+    return msb * 2 + lsb
+
+
+def _etc_t_mode(b, idx):
+    R1 = (((b[:, 0] >> 3) & 3) << 2) | (b[:, 0] & 3)
+    G1, B1 = b[:, 1] >> 4, b[:, 1] & 15
+    R2, G2, B2 = b[:, 2] >> 4, b[:, 2] & 15, b[:, 3] >> 4
+    d = _ETC2_DIST[(((b[:, 3] >> 2) & 3) << 1) | (b[:, 3] & 1)][:, None]
+    c1 = np.stack([R1, G1, B1], axis=1) * 17
+    c2 = np.stack([R2, G2, B2], axis=1) * 17
+    paint = np.stack([c1, np.clip(c2 + d, 0, 255), c2, np.clip(c2 - d, 0, 255)], axis=1)
+    return np.take_along_axis(paint, idx[:, :, None], axis=1)
+
+
+def _etc_h_mode(b, idx):
+    R1 = (b[:, 0] >> 3) & 15
+    G1 = ((b[:, 0] & 7) << 1) | ((b[:, 1] >> 4) & 1)
+    B1 = (b[:, 1] & 8) | ((b[:, 1] & 3) << 1) | ((b[:, 2] >> 7) & 1)
+    R2 = (b[:, 2] >> 3) & 15
+    G2 = ((b[:, 2] & 7) << 1) | (b[:, 3] >> 7)
+    B2 = (b[:, 3] >> 3) & 15
+    key1, key2 = (R1 << 8) | (G1 << 4) | B1, (R2 << 8) | (G2 << 4) | B2
+    di = (b[:, 3] & 4) | ((b[:, 3] & 1) << 1) | (key1 >= key2).astype(np.int64)
+    d = _ETC2_DIST[di][:, None]
+    c1 = np.stack([R1, G1, B1], axis=1) * 17
+    c2 = np.stack([R2, G2, B2], axis=1) * 17
+    paint = np.stack([np.clip(c1 + d, 0, 255), np.clip(c1 - d, 0, 255),
+                      np.clip(c2 + d, 0, 255), np.clip(c2 - d, 0, 255)], axis=1)
+    return np.take_along_axis(paint, idx[:, :, None], axis=1)
+
+
+def _etc_planar_mode(b):
+    RO = (b[:, 0] >> 1) & 63
+    GO = ((b[:, 0] & 1) << 6) | ((b[:, 1] >> 1) & 63)
+    BO = ((b[:, 1] & 1) << 5) | (b[:, 2] & 0x18) | ((b[:, 2] & 3) << 1) | (b[:, 3] >> 7)
+    RH = ((b[:, 3] >> 1) & 0x3E) | (b[:, 3] & 1)
+    GH = b[:, 4] >> 1
+    BH = ((b[:, 4] & 1) << 5) | (b[:, 5] >> 3)
+    RV = ((b[:, 5] & 7) << 3) | (b[:, 6] >> 5)
+    GV = ((b[:, 6] & 31) << 2) | (b[:, 7] >> 6)
+    BV = b[:, 7] & 63
+
+    def e6(v):
+        return (v << 2) | (v >> 4)
+
+    def e7(v):
+        return (v << 1) | (v >> 6)
+
+    out = []
+    for o, h, v in ((e6(RO), e6(RH), e6(RV)), (e7(GO), e7(GH), e7(GV)), (e6(BO), e6(BH), e6(BV))):
+        val = (_PX[None, :] * (h - o)[:, None] + _PY[None, :] * (v - o)[:, None]
+               + 4 * o[:, None] + 2) >> 2
+        out.append(np.clip(val, 0, 255))
+    return np.stack(out, axis=2)
+
+
+def _etc2_rgb(blk, a1=False):
+    """blk: (N, 8) uint8 -> rgb (N,16,3), alpha (N,16) (int64). a1 - режим punchthrough-альфы."""
+    b = blk.astype(np.int64)
+    n = len(b)
+    idx = _etc_idx_word(b)
+    flag = (b[:, 3] >> 1) & 1                  # diff-бит (в режиме A1 это бит "непрозрачный")
+    flip = b[:, 3] & 1
+    cw = np.stack([(b[:, 3] >> 5) & 7, (b[:, 3] >> 2) & 7], axis=1)
+
+    def sgn3(v):
+        return (v & 7) - ((v & 4) << 1)
+
+    r1, g1, b1 = b[:, 0] >> 3, b[:, 1] >> 3, b[:, 2] >> 3
+    r2, g2, b2 = r1 + sgn3(b[:, 0]), g1 + sgn3(b[:, 1]), b1 + sgn3(b[:, 2])
+    use_diff = (flag == 1) | a1
+
+    def ovf(v):
+        return (v < 0) | (v > 31)
+
+    # ETC2: переполнение в дифференциальном режиме выбирает T / H / planar
+    mode = np.where(use_diff & ovf(r2), 1,
+                    np.where(use_diff & ovf(g2), 2,
+                             np.where(use_diff & ovf(b2), 3, 0)))
+
+    def e5(v):
+        return (v << 3) | (v >> 2)
+
+    c_ind = np.stack([np.stack([b[:, 0] >> 4, b[:, 1] >> 4, b[:, 2] >> 4], axis=1),
+                      np.stack([b[:, 0] & 15, b[:, 1] & 15, b[:, 2] & 15], axis=1)], axis=1) * 17
+    c_dif = np.stack([e5(np.stack([r1, g1, b1], axis=1)),
+                      e5(np.stack([r2, g2, b2], axis=1))], axis=1)
+    c = np.where(use_diff[:, None, None], c_dif, c_ind)              # (N, 2, 3)
+
+    sub = np.where((flip == 0)[:, None], (_PX >= 2)[None, :], (_PY >= 2)[None, :]).astype(np.int64)
+    base = np.take_along_axis(c, sub[:, :, None], axis=1)            # (N, 16, 3)
+    mag = _ETC_MOD[np.take_along_axis(cw, sub, axis=1), idx & 1]
+    mod = np.where((idx >> 1) & 1, -mag, mag)
+    if a1:                                     # прозрачный режим: модификаторы {0, +b, 0, -b}
+        mod = np.where(((flag == 0)[:, None]) & ((idx & 1) == 0), 0, mod)
+    rgb = np.clip(base + mod[:, :, None], 0, 255)
+
+    for m, fn in ((1, _etc_t_mode), (2, _etc_h_mode)):
+        sel = mode == m
+        if sel.any():
+            rgb[sel] = fn(b[sel], idx[sel])
+    sel = mode == 3
+    if sel.any():
+        rgb[sel] = _etc_planar_mode(b[sel])
+
+    alpha = np.full((n, 16), 255, dtype=np.int64)
+    if a1:
+        clear = ((flag == 0)[:, None]) & (idx == 2) & (mode != 3)[:, None]
+        alpha[clear] = 0
+        rgb[clear] = 0
+    return rgb, alpha
+
+
+def _eac_values(blk8, bits11, signed=False):
+    """EAC-блок (8 байт) -> (N,16): 8-битная альфа или 11-битный канал, приведённый к 0..255."""
+    b = blk8.astype(np.int64)
+    tab = b[:, 1] & 15
+    mul = b[:, 1] >> 4
+    bits = np.zeros(len(b), dtype=np.int64)
+    for i in range(6):
+        bits = (bits << 8) | b[:, 2 + i]
+    ci = (bits[:, None] >> (45 - 3 * _P16)) & 7
+    mod = _EAC_MOD[tab[:, None], ci]
+    if not bits11:
+        mulv = np.where(mul == 0, 1, mul)[:, None]
+        return np.clip(b[:, :1] + mod * mulv, 0, 255)
+    mulv = np.where(mul == 0, 1, mul * 8)[:, None]
+    if not signed:
+        v = np.clip(b[:, :1] * 8 + 4 + mod * mulv, 0, 2047)
+        return (v * 255 + 1023) // 2047
+    base = np.where(b[:, :1] > 127, b[:, :1] - 256, b[:, :1]) * 8
+    v = np.clip(base + mod * mulv, -1023, 1023)
+    return ((v + 1023) * 255 + 1023) // 2046
+
+
+def _etc_chunk(kind, blk):
+    """(N, 8 или 16) uint8 -> (N, 16, 4) uint8 RGBA в порядке пикселей p = x*4 + y."""
+    n = len(blk)
+    out = np.empty((n, 16, 4), dtype=np.uint8)
+    out[..., 3] = 255
+    if kind == "etc2":
+        out[..., :3] = _etc2_rgb(blk)[0]
+    elif kind == "etc2a1":
+        rgb, a = _etc2_rgb(blk, a1=True)
+        out[..., :3], out[..., 3] = rgb, a
+    elif kind == "etc2a8":
+        out[..., 3] = _eac_values(blk[:, :8], False)
+        out[..., :3] = _etc2_rgb(blk[:, 8:])[0]
+    elif kind in ("eac_r", "eac_rs"):
+        out[..., :3] = _eac_values(blk, True, kind == "eac_rs")[:, :, None]
+    else:                                      # eac_rg / eac_rgs
+        s = kind == "eac_rgs"
+        out[..., 0] = _eac_values(blk[:, :8], True, s)
+        out[..., 1] = _eac_values(blk[:, 8:], True, s)
+        out[..., 2] = 0
+    return out
+
+
+def decode_etc_image(kind, image_data, width, height):
+    """Декодирует ETC1/ETC2/EAC (mip0) в RGBA."""
+    bw, bh = (width + 3) // 4, (height + 3) // 4
+    bpb = 16 if kind in ("etc2a8", "eac_rg", "eac_rgs") else 8
+    need = bw * bh * bpb
+    raw = bytes(image_data[:need])
+    if len(raw) < need:
+        raw += b"\x00" * (need - len(raw))
+    buf = np.frombuffer(raw, dtype=np.uint8).reshape(-1, bpb)
+    out = np.empty((bw * bh, 16, 4), dtype=np.uint8)
+    for s in range(0, len(buf), _ETC_CHUNK):
+        out[s:s + _ETC_CHUNK] = _etc_chunk(kind, buf[s:s + _ETC_CHUNK])
+    # (блок, x, y, c) -> картинка (строка, столбец, c)
+    arr = out.reshape(bh, bw, 4, 4, 4).transpose(0, 3, 1, 2, 4).reshape(bh * 4, bw * 4, 4)
+    img = Image.fromarray(np.ascontiguousarray(arr), "RGBA")
+    return img.crop((0, 0, width, height))
+
+
+def decode_astc_image(kind, image_data, width, height):
+    """ASTC через модуль texture2ddecoder (pip install texture2ddecoder)."""
+    bx, by = (int(v) for v in kind[4:].split("x"))
+    try:
+        import texture2ddecoder
+    except ImportError:
+        raise ValueError("Для ASTC нужен модуль texture2ddecoder.\n"
+                         "Поставь его командой:  pip install texture2ddecoder") from None
+    need = ((width + bx - 1) // bx) * ((height + by - 1) // by) * 16
+    raw = bytes(image_data[:need])
+    if len(raw) < need:
+        raw += b"\x00" * (need - len(raw))
+    dec = texture2ddecoder.decode_astc(raw, width, height, bx, by)
+    return Image.frombytes("RGBA", (width, height), dec, "raw", "BGRA")
+
+
+def is_mobile_kind(kind):
+    return kind.startswith(("etc", "eac", "astc"))
+
+
+def kind_bytes_per_pixel(kind):
+    """Размер сжатой текстуры на пиксель (для оценки места на диске)."""
+    if kind.startswith("astc"):
+        bx, by = (int(v) for v in kind[4:].split("x"))
+        return 16.0 / (bx * by)
+    return {"bc7": 1.0, "bc4": 0.5, "rgba8": 4.0, "etc2": 0.5, "etc2a1": 0.5, "etc2a8": 1.0,
+            "eac_r": 0.5, "eac_rs": 0.5, "eac_rg": 1.0, "eac_rgs": 1.0}[kind]
+
+
+FORMATS.update(ETC_FORMATS)
+FORMATS.update(ASTC_FORMATS)
+
+
 def decode_image(kind, image_data, width, height):
     """Декодирует mip0 в RGBA-картинку."""
     if kind == "rgba8":
         return decode_raw_rgba8_image(image_data, width, height)
+    if kind.startswith("astc"):
+        return decode_astc_image(kind, image_data, width, height)
+    if is_mobile_kind(kind):                     # ETC1 / ETC2 / EAC
+        return decode_etc_image(kind, image_data, width, height)
     n = 7 if kind == "bc7" else 4
     try:
         return _pil_bcn_decode(image_data, width, height, n)
@@ -516,8 +785,150 @@ def _bc4_blocks(blocks):
 def _encode_strip(kind, arr):
     """Задача для рабочего процесса: кодирует полосу картинки."""
     blocks = _to_blocks(arr)
-    fn = _bc7_mode6_blocks if kind == "bc7" else _bc4_blocks
+    if is_mobile_kind(kind):
+        fn = functools.partial(_mobile_blocks, kind)
+    else:
+        fn = _bc7_mode6_blocks if kind == "bc7" else _bc4_blocks
     return b"".join(fn(blocks[i:i + _CHUNK_BLOCKS]) for i in range(0, len(blocks), _CHUNK_BLOCKS))
+
+
+# ---------- кодирование ETC2 / EAC (мобильные форматы) ----------
+# ETC2 RGB: используется только режим "дифференциальный" ETC1 (его читает любой
+# декодер): два под-блока 2x4 или 4x2, базовые цвета по 5 бит, 8 таблиц яркости.
+# Для каждого блока перебираются обе ориентации и все 8 таблиц - берётся лучшая.
+
+_PM = (_P16 % 4) * 4 + _P16 // 4        # номер пикселя p=x*4+y -> индекс в строчном порядке
+_ETC_SUB = np.stack([_PX >= 2, _PY >= 2])   # (2, 16): принадлежность к 2-му под-блоку при flip=0/1
+_ETC_MODS = np.stack([_ETC_MOD[:, 0], _ETC_MOD[:, 1], -_ETC_MOD[:, 0], -_ETC_MOD[:, 1]], axis=1)  # (8, 4)
+_ENC_SUBCHUNK = 2048
+
+
+def _etc_encode_sub(pix, q):
+    """pix: (N, 8, 3) int32, q: (N, 3) 5-битный базовый цвет -> (ошибка (N,), таблица (N,), индексы (N, 8))."""
+    base = (q << 3) | (q >> 2)
+    pred = np.clip(base[:, None, None, None, :] + _ETC_MODS[None, None, :, :, None], 0, 255)  # (N,1,8,4,3)
+    diff = pix[:, :, None, None, :] - pred                                                     # (N,8,8,4,3)
+    err = (diff * diff).sum(axis=-1)                                                           # (N,8px,8tab,4mod)
+    idx = err.argmin(axis=3)                                                                   # (N,8px,8tab)
+    tot = np.take_along_axis(err, idx[..., None], axis=3)[..., 0].sum(axis=1)                  # (N,8tab)
+    tab = tot.argmin(axis=1)
+    best_err = np.take_along_axis(tot, tab[:, None], axis=1)[:, 0]
+    best_idx = np.take_along_axis(idx, tab[:, None, None], axis=2)[:, :, 0]
+    return best_err, tab, best_idx
+
+
+def _etc2_rgb_chunk(p):
+    """p: (N, 16, 3) int32 в порядке p=x*4+y -> (N, 8) uint8."""
+    n = len(p)
+    res = []
+    for f in (0, 1):
+        m2 = _ETC_SUB[f]
+        m1 = ~m2
+        q = []
+        for m in (m1, m2):
+            mean = p[:, m, :].mean(axis=1)
+            q.append(np.clip(np.rint(mean * (31.0 / 255.0)), 0, 31).astype(np.int32))
+        q0 = q[0]
+        q1 = np.clip(q[1], np.maximum(q0 - 4, 0), np.minimum(q0 + 3, 31))   # дельта в [-4, 3]
+        e1, t1, i1 = _etc_encode_sub(p[:, m1, :], q0)
+        e2, t2, i2 = _etc_encode_sub(p[:, m2, :], q1)
+        idx = np.zeros((n, 16), dtype=np.int64)
+        idx[:, m1] = i1
+        idx[:, m2] = i2
+        res.append((e1 + e2, q0, q1, t1, t2, idx))
+    use1 = (res[1][0] < res[0][0])
+    pick = lambda k: np.where(use1[:, None] if res[0][k].ndim == 2 else use1, res[1][k], res[0][k])
+    q0, q1, t1, t2, idx = pick(1), pick(2), pick(3), pick(4), pick(5)
+    d = (q1 - q0) & 7
+    out = np.empty((n, 8), dtype=np.uint8)
+    out[:, 0] = (q0[:, 0] << 3) | d[:, 0]
+    out[:, 1] = (q0[:, 1] << 3) | d[:, 1]
+    out[:, 2] = (q0[:, 2] << 3) | d[:, 2]
+    out[:, 3] = (t1 << 5) | (t2 << 2) | 2 | use1.astype(np.int64)
+    word = np.zeros(n, dtype=np.int64)
+    for k in range(16):
+        word |= (idx[:, k] & 1) << k
+        word |= ((idx[:, k] >> 1) & 1) << (16 + k)
+    for i in range(4):
+        out[:, 4 + i] = (word >> (8 * (3 - i))) & 255
+    return out
+
+
+def _etc2_rgb_blocks(blocks):
+    """blocks: (N, 16, 3) uint8, строчный порядок -> N * 8 байт ETC2 RGB8."""
+    p = blocks[:, _PM, :].astype(np.int32)
+    return np.concatenate([_etc2_rgb_chunk(p[i:i + _ENC_SUBCHUNK])
+                           for i in range(0, len(p), _ENC_SUBCHUNK)]).tobytes() if len(p) else b""
+
+
+def _eac_encode_chunk(v):
+    """v: (N, 16) int32 (0..255, порядок p) -> (N, 8) uint8 EAC (то же годится для R11)."""
+    n = len(v)
+    lo, hi = v.min(axis=1), v.max(axis=1)
+    rng, mid = (hi - lo).astype(np.float64), (hi + lo) / 2.0
+    best_err = np.full(n, np.iinfo(np.int64).max, dtype=np.int64)
+    best_t = np.zeros(n, dtype=np.int64)
+    best_mul = np.ones(n, dtype=np.int64)
+    best_base = np.zeros(n, dtype=np.int64)
+    best_idx = np.zeros((n, 16), dtype=np.int64)
+    for t in range(16):
+        mt = _EAC_MOD[t]
+        span = float(mt.max() - mt.min())
+        mmid = (mt.max() + mt.min()) / 2.0
+        m0 = np.clip(np.rint(rng / span), 1, 15).astype(np.int64)
+        for dm in (-1, 0, 1):
+            mul = np.clip(m0 + dm, 1, 15)
+            base = np.clip(np.rint(mid - mul * mmid), 0, 255).astype(np.int64)
+            rec = np.clip(base[:, None, None] + mul[:, None, None] * mt[None, None, :], 0, 255)
+            e = (v[:, :, None] - rec) ** 2
+            idx = e.argmin(axis=2)
+            tot = np.take_along_axis(e, idx[:, :, None], axis=2)[:, :, 0].sum(axis=1)
+            better = tot < best_err
+            if better.any():
+                best_err = np.where(better, tot, best_err)
+                best_t = np.where(better, t, best_t)
+                best_mul = np.where(better, mul, best_mul)
+                best_base = np.where(better, base, best_base)
+                best_idx = np.where(better[:, None], idx, best_idx)
+    flat = hi == lo                                  # одноцветный блок: таблица 13, индекс 4 = модификатор 0
+    best_t[flat], best_mul[flat], best_base[flat], best_idx[flat] = 13, 1, hi[flat], 4
+    out = np.empty((n, 8), dtype=np.uint8)
+    out[:, 0] = best_base
+    out[:, 1] = (best_mul << 4) | best_t
+    bits = np.zeros(n, dtype=np.uint64)
+    for k in range(16):
+        bits |= best_idx[:, k].astype(np.uint64) << np.uint64(45 - 3 * k)
+    for i in range(6):
+        out[:, 2 + i] = ((bits >> np.uint64(8 * (5 - i))) & np.uint64(255)).astype(np.uint8)
+    return out
+
+
+def _eac_blocks(vals):
+    """vals: (N, 16) uint8, строчный порядок -> (N, 8) uint8 (пачками по _ENC_SUBCHUNK)."""
+    p = vals[:, _PM].astype(np.int64)
+    return np.concatenate([_eac_encode_chunk(p[i:i + _ENC_SUBCHUNK])
+                           for i in range(0, len(p), _ENC_SUBCHUNK)]) if len(p) else np.zeros((0, 8), np.uint8)
+
+
+def _mobile_blocks(kind, blocks):
+    """Кодирует пачку блоков мобильного формата в байты."""
+    if kind == "etc2":
+        return _etc2_rgb_blocks(blocks[:, :, :3])
+    rgb_n = len(blocks)
+    if kind == "etc2a8":
+        a = _eac_blocks(blocks[:, :, 3])
+        c = np.frombuffer(_etc2_rgb_blocks(blocks[:, :, :3]), dtype=np.uint8).reshape(rgb_n, 8)
+        return np.concatenate([a, c], axis=1).tobytes()
+    if kind == "eac_r":
+        return _eac_blocks(blocks).tobytes()
+    if kind == "eac_rg":
+        return np.concatenate([_eac_blocks(blocks[:, :, 0]), _eac_blocks(blocks[:, :, 1])], axis=1).tobytes()
+    raise ValueError(f"Кодирование формата {kind} не поддерживается")
+
+
+ENCODABLE_KINDS = ("bc7", "bc4", "rgba8", "etc2", "etc2a8", "eac_r", "eac_rg")
+_ENC_MODE = {"bc7": "RGBA", "bc4": "L", "rgba8": "RGBA", "etc2": "RGB", "etc2a8": "RGBA",
+             "eac_r": "L", "eac_rg": "RGBA"}
 
 
 # ---------- пул процессов ----------
@@ -568,7 +979,7 @@ def encode_level(img, kind, on_blocks=lambda n: None, parallel=True):
         on_blocks(((img.width + 3) // 4) * ((img.height + 3) // 4))
         return data
 
-    arr = np.asarray(img.convert("RGBA" if kind == "bc7" else "L"))
+    arr = np.asarray(img.convert(_ENC_MODE[kind]))
     h, w = arr.shape[:2]
     ph, pw = (-h) % 4, (-w) % 4
     if ph or pw:
@@ -648,9 +1059,13 @@ def build_ktx(image, original_ktx_path, progress=lambda frac, text: None, parall
     header_d, _, header_len = parse_ktx_bytes(orig)
     check_simple_2d(header_d)
     fmt_name, kind = FORMATS[header_d['glInternalFormat']]
+    if kind not in ENCODABLE_KINDS:
+        raise ValueError(f"Формат {fmt_name} можно только декодировать.\n"
+                         "Кодирование для него не поддерживается "
+                         "(кодируются BC7, BC4, RGBA8, ETC2 RGB/RGBA, EAC R11/RG11).")
 
     layers = layer_count(header_d)
-    layer_imgs = split_layers(image.convert("L" if kind == "bc4" else "RGBA"), layers)
+    layer_imgs = split_layers(image.convert("L" if kind in ("bc4", "eac_r") else "RGBA"), layers)
     w, h = layer_imgs[0].size
     levels = mip_level_count(header_d, w, h)
 
@@ -782,7 +1197,7 @@ def folder_tag(slot, root):
 
 
 def est_ktx_bytes(w, h, layers, kind, mips):
-    bpp = {"bc7": 1.0, "bc4": 0.5, "rgba8": 4.0}[kind]
+    bpp = kind_bytes_per_pixel(kind)
     return int(w * h * layers * bpp * (4 / 3 if mips > 1 else 1))
 
 
@@ -876,7 +1291,7 @@ def _number_font(size):
 
 def number_color(number, kind):
     """Цвет фона для номера: соседние номера заметно различаются по оттенку."""
-    if kind == "bc4":                            # BC4 - один канал, оттенок не виден
+    if kind in ("bc4", "eac_r"):                 # BC4 / R11 - один канал, оттенок не виден
         g = 40 + (number * 53) % 110
         return (g, g, g)
     r, g, b = colorsys.hsv_to_rgb((number * 0.61803398875) % 1.0, 0.65, 0.55)
@@ -1056,6 +1471,9 @@ def plan_encode_jobs(items, mode, o):
             bad.append(it)
             continue
         w, h = it["w"], it["h"]
+        if it["kind"] not in ENCODABLE_KINDS:
+            skipped.append((it, "формат только для декодирования (ASTC / ETC2 с 1-бит альфой / signed EAC)"))
+            continue
         if mode == "rescale":
             if max(w, h) < o["min_src"]:
                 skipped.append((it, f"сторона меньше {o['min_src']}"))
